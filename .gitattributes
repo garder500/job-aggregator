@@ -1,0 +1,5 @@
+*.sh text eol=lf
+ops/poste text eol=lf
+ops/pg-client-bin/* text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf

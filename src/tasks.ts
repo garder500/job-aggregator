@@ -9,6 +9,8 @@ import type { TaskList } from "graphile-worker";
 import { automationGate, ReviewError } from "./runner.js";
 import { canonicalUrl } from "./urls.js";
 import { pruneEvidence } from "./evidence.js";
+import { operationDocument, enrichJob } from "./operations.js";
+import { runDiagnostic } from "./diagnostics.js";
 export const tasks = {
   async process_job({ id }: { id: string }) {
     const prefs = await settings();
@@ -67,7 +69,7 @@ export const tasks = {
       !evaluation.data.unknowns.length
     ) {
       const candidates = await query(
-        "SELECT * FROM connectors WHERE enabled AND authorized AND auto_submit AND kind='form'",
+        "SELECT * FROM connectors WHERE enabled AND authorized AND auto_submit AND submission_mode='automatic' AND kind='form'",
       );
       const connector = candidates.find(
         (c) => canonicalUrl(c.config.url) === job.canonical_url,
@@ -177,10 +179,24 @@ export const tasks = {
     await query(
       "UPDATE application_attempts t SET state=a.runner_state,finished_at=now() FROM applications a WHERE t.application_id=a.id AND t.state IN ('preparing','submitting') AND a.runner_state IN ('unknown','needs_review') AND t.created_at<now()-interval '10 minutes'",
     );
+    await query(
+      "UPDATE operation_items SET state='failed',message='Traitement interrompu ; verification requise',updated_at=now() WHERE state='running' AND updated_at<now()-interval '10 minutes'",
+    );
+    await query(
+      "UPDATE diagnostics SET state='failed',message='Diagnostic interrompu' WHERE state='queued' AND checked_at<now()-interval '10 minutes'",
+    );
   },
 };
 const idPayload = z.object({ id: z.string().min(1) });
 export const taskList: TaskList = {
+  operation_document: operationDocument,
+  enrich_job: async (p) => enrichJob(p),
+  diagnostic: async (p) =>
+    runDiagnostic(
+      z
+        .object({ integration: z.enum(["imap", "notifications", "ai"]) })
+        .parse(p).integration,
+    ),
   process_job: async (p) => tasks.process_job(idPayload.parse(p)),
   notify: async (p) => tasks.notify(idPayload.parse(p)),
   collect: async (p) => tasks.collect(idPayload.parse(p)),

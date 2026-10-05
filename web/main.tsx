@@ -44,6 +44,7 @@ import {
 import type { Profile, Settings } from "../src/domain";
 import { canonicalUrl } from "../src/urls";
 import "./style.css";
+import { SetupChecklist, ReviewQueue } from "./workflows";
 const client = new QueryClient({
   defaultOptions: { queries: { retry: false, refetchInterval: 10000 } },
 });
@@ -53,7 +54,10 @@ async function api(path: string, body?: unknown) {
     ...(body !== undefined
       ? {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": crypto.randomUUID(),
+          },
           body: JSON.stringify(body),
         }
       : {}),
@@ -248,6 +252,7 @@ function App() {
     { id: "jobs", name: "Offres", icon: LayoutList },
     { id: "applications", name: "Candidatures", icon: Columns3 },
     { id: "documents", name: "Documents", icon: FileText },
+    { id: "review", name: "À valider", icon: ShieldCheck },
     { id: "connectors", name: "Connecteurs", icon: Plug },
     { id: "settings", name: "Configuration", icon: Settings2 },
   ];
@@ -391,6 +396,7 @@ function App() {
             <Applications run={run} select={setSelected} busy={busy} />
           )}
           {view === "documents" && <Documents run={run} busy={busy} />}
+          {view === "review" && <ReviewQueue api={api} select={setSelected} />}
           {view === "connectors" && (
             <Connectors
               run={run}
@@ -399,7 +405,12 @@ function App() {
               overview={overview.data}
             />
           )}
-          {view === "settings" && <Configuration act={act} busy={busy} />}
+          {view === "settings" && (
+            <>
+              <SetupChecklist api={api} />
+              <Configuration act={act} busy={busy} />
+            </>
+          )}
         </main>
         <footer>
           Poste · Espace privé
@@ -920,6 +931,7 @@ function JobDetail({
       queryFn: () => api("/connectors"),
     });
   const [connector, setConnector] = useState(""),
+    [enrichment, setEnrichment] = useState(""),
     [evidence, setEvidence] = useState("");
   const j = job.data;
   const ev = j?.evaluations?.[0];
@@ -979,6 +991,44 @@ function JobDetail({
                 ))}
               </div>
               <h3>Provenance</h3>
+              <div className="detail-actions">
+                <select
+                  aria-label="Source d’enrichissement"
+                  value={enrichment}
+                  onChange={(e) => setEnrichment(e.target.value)}
+                >
+                  <option value="">Source autorisée</option>
+                  {connectors.data
+                    ?.filter(
+                      (c: any) =>
+                        c.kind === "html" &&
+                        c.enabled &&
+                        c.authorized &&
+                        c.config.allowedHosts?.includes(
+                          new URL(j.canonical_url).hostname,
+                        ),
+                    )
+                    .map((c: any) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                </select>
+                <button
+                  className="button"
+                  disabled={busy || !enrichment}
+                  onClick={() =>
+                    run(
+                      `/jobs/${id}/enrich`,
+                      { connectorId: enrichment },
+                      "Enrichissement en file",
+                    )
+                  }
+                >
+                  <RefreshCw size={15} />
+                  Enrichir
+                </button>
+              </div>
               {j.sources.map((s: any, i: number) => (
                 <a
                   key={i}
@@ -1637,6 +1687,7 @@ function Connectors({
                   enabled: editing.enabled,
                   authorized: editing.authorized,
                   auto_submit: editing.auto_submit,
+                  submission_mode: editing.submission_mode || "review_required",
                   config: JSON.parse(text),
                 });
                 setEditing(null);
@@ -1731,6 +1782,20 @@ function Connectors({
               Actif
             </label>
             {editing.kind === "form" && (
+              <label>
+                Mode de soumission
+                <select
+                  value={editing.submission_mode || "review_required"}
+                  onChange={(e) =>
+                    setEditing({ ...editing, submission_mode: e.target.value })
+                  }
+                >
+                  <option value="review_required">Validation explicite</option>
+                  <option value="automatic">Automatique</option>
+                </select>
+              </label>
+            )}
+            {editing.kind === "form" && (
               <label className="check-label">
                 <input
                   type="checkbox"
@@ -1739,7 +1804,7 @@ function Connectors({
                     setEditing({ ...editing, auto_submit: e.target.checked })
                   }
                 />
-                Soumission automatique autorisée
+                Soumission autorisée après préparation
               </label>
             )}
             {localError && (

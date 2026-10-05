@@ -12,6 +12,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
       - run: npx playwright install --with-deps chromium
       - run: npm test
       - run: chmod +x ops/pg-client.sh ops/pg-client-bin/*
@@ -24,3 +26,46 @@ jobs:
         with:
           name: browser-results
           path: test-results
+  container:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          cp .env.example .env
+          printf '\nAPP_PASSWORD=%s\nSESSION_SECRET=%s\nPOSTGRES_PASSWORD=%s\nDATABASE_URL=%s\nAPP_ORIGIN=http://localhost:3001\n' "$(openssl rand -hex 16)" "$(openssl rand -hex 32)" 'ci-database-password' 'postgres://job:ci-database-password@postgres:5432/jobs' >> .env
+          docker build --label org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" --label org.opencontainers.image.revision="$GITHUB_SHA" -t poste:ci .
+          POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml up -d --wait app worker runner
+      - run: POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml exec -T app node --import tsx scripts/container-smoke.ts
+      - run: |
+          POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml stop runner
+          POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml run --rm --no-deps -T -e NODE_ENV=test app node --import tsx scripts/container-runner-test.ts
+          POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml up -d runner
+      - run: |
+          POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml restart app worker runner postgres
+          POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml up -d --wait app worker runner
+          POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml exec -T app node --import tsx scripts/container-smoke.ts --persisted
+      - name: Publish immutable image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$GITHUB_SHA"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag poste:ci "$image"
+          docker push "$image"
+          docker pull "$image"
+          docker inspect --format='{{index .RepoDigests 0}}' "$image" > image-digest.txt
+          printf 'Deployment image: `%s`\n' "$(cat image-digest.txt)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: image-digest
+          path: image-digest.txt
+      - if: failure()
+        run: POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml logs --tail=150
+      - if: always()
+        run: POSTE_IMAGE=poste:ci docker compose -f compose.production.yaml down -v

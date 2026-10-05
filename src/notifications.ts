@@ -6,6 +6,7 @@ export async function queueNotification(
   key: string,
   text: string,
   jobId: string | null,
+  schedule = true,
 ) {
   const prefs = await settings();
   await transaction(async (tx) => {
@@ -14,7 +15,8 @@ export async function queueNotification(
       [key, prefs.notificationChannel, JSON.stringify({ text, jobId })],
       tx,
     );
-    if (row) await enqueue("notify", { id: row.id }, `notify:${row.id}`, tx);
+    if (row && schedule)
+      await enqueue("notify", { id: row.id }, `notify:${row.id}`, tx);
   });
 }
 export async function deliverNotification(id: string) {

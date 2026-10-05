@@ -73,10 +73,6 @@ test("profil, import rejoue, suivi et CV approuve", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "CV · Ciblé" })).toBeVisible({
     timeout: 20000,
   });
-  await page.getByRole("button", { name: "Approuver", exact: true }).click();
-  await expect(
-    page.getByRole("button", { name: "Retirer l’approbation" }),
-  ).toBeVisible();
   const pdf = await page.request.get(
     (await page
       .getByRole("link", { name: "PDF", exact: true })
@@ -84,6 +80,49 @@ test("profil, import rejoue, suivi et CV approuve", async ({ page }) => {
   );
   expect(pdf.ok()).toBe(true);
   expect((await pdf.body()).subarray(0, 4).toString()).toBe("%PDF");
+  await page.getByRole("button", { name: "Approuver", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Retirer l’approbation" }),
+  ).toBeVisible();
+  await page
+    .getByRole("navigation")
+    .getByRole("button", { name: "À valider", exact: true })
+    .click();
+  await page
+    .getByLabel("Sélectionner Développeur TypeScript", { exact: true })
+    .check();
+  await expect(
+    page.getByRole("button", { name: "Soumettre la sélection" }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "Soumettre la sélection" }).click();
+  await expect(
+    page.getByRole("dialog", { name: "Confirmer la soumission" }),
+  ).toContainText("Connecteur non autorise");
+  await expect(
+    page.getByRole("button", { name: "Confirmer l’envoi" }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Annuler", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Générer les CV", exact: true })
+    .click();
+  await expect(page.getByText("cv · 1/1", { exact: true })).toBeVisible({
+    timeout: 20000,
+  });
+  await page.screenshot({
+    path: "test-results/review-desktop.png",
+    fullPage: true,
+    animations: "disabled",
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth))
+    .toBe(390);
+  await page.screenshot({
+    path: "test-results/review-mobile.png",
+    fullPage: true,
+    animations: "disabled",
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
   await page
     .getByRole("navigation")
     .getByRole("button", { name: "Candidatures", exact: true })

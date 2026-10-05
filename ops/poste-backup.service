@@ -1,0 +1,8 @@
+[Unit]
+Description=Poste encrypted offsite backup
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/poste
+ExecStart=/bin/bash /opt/poste/ops/poste backup
+User=poste
+UMask=0077

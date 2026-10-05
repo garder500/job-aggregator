@@ -6,3 +6,5 @@ data
 sessions
 test-results
 playwright-report
+.ops*
+backups

@@ -29,6 +29,13 @@ import { migrate } from "./migrate.js";
 import { formSchema, automationGate, ReviewError } from "./runner.js";
 import { validatePublicUrl } from "./network.js";
 import { evidencePath } from "./evidence.js";
+import { setupStatus } from "./diagnostics.js";
+import {
+  batchSchema,
+  createBatch,
+  submissionEligibility,
+} from "./operations.js";
+import { hash } from "./domain.js";
 class InputError extends Error {}
 const uuid = z.uuid();
 const passwordSalt = randomBytes(16);
@@ -321,6 +328,9 @@ export async function createServer() {
         enabled: z.boolean(),
         authorized: z.boolean(),
         auto_submit: z.boolean().default(false),
+        submission_mode: z
+          .enum(["review_required", "automatic"])
+          .default("review_required"),
         config: z.record(z.string(), z.unknown()),
       })
       .parse(req.body);
@@ -376,6 +386,10 @@ export async function createServer() {
       ],
     );
     await event("connector.updated", body.id);
+    await query("UPDATE connectors SET submission_mode=$2 WHERE id=$1", [
+      body.id,
+      body.submission_mode,
+    ]);
     if (body.auto_submit)
       for (const job of await query(
         "SELECT id FROM jobs WHERE canonical_url=$1",
@@ -409,6 +423,136 @@ export async function createServer() {
       "SELECT a.*,j.data,e.score FROM applications a JOIN jobs j ON j.id=a.job_id LEFT JOIN LATERAL (SELECT score FROM evaluations WHERE job_id=j.id AND profile_id=(SELECT id FROM profiles ORDER BY version DESC LIMIT 1) ORDER BY created_at DESC LIMIT 1)e ON true ORDER BY a.updated_at DESC",
     ),
   );
+  app.get("/api/setup", setupStatus);
+  app.post("/api/diagnostics/:integration", async (req) => {
+    const integration = z
+      .enum(["imap", "notifications", "ai"])
+      .parse((req.params as any).integration);
+    const key = z
+      .string()
+      .min(8)
+      .max(120)
+      .parse(req.headers["idempotency-key"]);
+    return transaction(async (tx) => {
+      const [op] = await query(
+        "INSERT INTO operations(kind,idempotency_key,request_hash) VALUES('diagnostic',$1,$2) ON CONFLICT DO NOTHING RETURNING id",
+        [key, hash(integration)],
+        tx,
+      );
+      if (!op) {
+        const [old] = await query(
+          "SELECT * FROM operations WHERE idempotency_key=$1",
+          [key],
+          tx,
+        );
+        if (old.request_hash !== hash(integration))
+          throw new ReviewError("Cle deja utilisee");
+        return { id: old.id };
+      }
+      const [existing] = await query(
+        "SELECT * FROM diagnostics WHERE integration=$1 FOR UPDATE",
+        [integration],
+        tx,
+      );
+      if (existing?.state === "queued")
+        throw new ReviewError("Diagnostic deja en cours");
+      await query(
+        "INSERT INTO diagnostics(integration,state,message) VALUES($1,'queued','Test demande') ON CONFLICT(integration) DO UPDATE SET state='queued',message='Test demande',checked_at=now()",
+        [integration],
+        tx,
+      );
+      await enqueue(
+        "diagnostic",
+        { integration },
+        `diagnostic:${integration}`,
+        tx,
+      );
+      await event("diagnostic.requested", op.id, { integration }, tx);
+      return op;
+    });
+  });
+  app.get("/api/review", async () => {
+    const apps = await query(
+      "SELECT a.*,j.data FROM applications a JOIN jobs j ON j.id=a.job_id WHERE a.status='to_apply' ORDER BY a.updated_at DESC LIMIT 100",
+    );
+    return Promise.all(
+      apps.map(async (a) => {
+        const { evaluation } = await evaluate(a.job_id);
+        const documents = await query(
+          "SELECT id,kind,approved_at,viewed_at FROM documents WHERE (job_id=$1 OR (job_id IS NULL AND kind='cv')) AND profile_id=(SELECT id FROM profiles ORDER BY version DESC LIMIT 1) ORDER BY created_at DESC",
+          [a.job_id],
+        );
+        return {
+          ...a,
+          evaluation,
+          documents,
+          eligibility: await submissionEligibility(a.id),
+        };
+      }),
+    );
+  });
+  app.post("/api/batches", async (req) =>
+    createBatch(
+      batchSchema.parse(req.body),
+      z.string().min(8).max(120).parse(req.headers["idempotency-key"]),
+    ),
+  );
+  app.get("/api/operations", async () =>
+    query(
+      "SELECT o.*,coalesce(jsonb_agg(i.*) FILTER(WHERE i.id IS NOT NULL),'[]') items FROM operations o LEFT JOIN operation_items i ON i.operation_id=o.id GROUP BY o.id ORDER BY o.created_at DESC LIMIT 20",
+    ),
+  );
+  app.get("/api/operations/:id", async (req) => {
+    const id = uuid.parse((req.params as any).id);
+    return {
+      ...(await query("SELECT * FROM operations WHERE id=$1", [id]))[0],
+      items: await query(
+        "SELECT * FROM operation_items WHERE operation_id=$1",
+        [id],
+      ),
+    };
+  });
+  app.post("/api/jobs/:id/enrich", async (req) => {
+    const jobId = uuid.parse((req.params as any).id);
+    const { connectorId } = z
+      .object({ connectorId: z.string().min(1).max(60) })
+      .parse(req.body);
+    const key = z
+      .string()
+      .min(8)
+      .max(120)
+      .parse(req.headers["idempotency-key"]);
+    return transaction(async (tx) => {
+      const digest = hash([jobId, connectorId]);
+      const [op] = await query(
+        "INSERT INTO operations(kind,idempotency_key,request_hash) VALUES('enrich',$1,$2) ON CONFLICT DO NOTHING RETURNING *",
+        [key, digest],
+        tx,
+      );
+      if (!op) {
+        const [old] = await query(
+          "SELECT * FROM operations WHERE idempotency_key=$1",
+          [key],
+          tx,
+        );
+        if (old.request_hash !== digest)
+          throw new ReviewError("Cle deja utilisee");
+        return old;
+      }
+      const [item] = await query(
+        "INSERT INTO operation_items(operation_id,job_id) VALUES($1,$2) RETURNING id",
+        [op.id, jobId],
+        tx,
+      );
+      await enqueue(
+        "enrich_job",
+        { itemId: item.id, jobId, connectorId },
+        `enrich:${item.id}`,
+        tx,
+      );
+      return op;
+    });
+  });
   app.post("/api/applications", async (req) => {
     const { jobId } = z.object({ jobId: uuid }).parse(req.body);
     return transaction(async (tx) => {
@@ -509,7 +653,16 @@ export async function createServer() {
         [id, connectorId],
         tx,
       );
-      if (mode === "submit") await automationGate(id, tx);
+      if (mode === "submit") {
+        if (a.runner_state !== "ready")
+          throw new ReviewError("Preparation supervisee requise");
+        const gate = await automationGate(id, tx, false);
+        await query(
+          "INSERT INTO submission_approvals(application_id,snapshot,expires_at) VALUES($1,$2,now()+interval '24 hours') ON CONFLICT(application_id) DO UPDATE SET snapshot=excluded.snapshot,expires_at=excluded.expires_at,consumed_at=NULL",
+          [id, JSON.stringify(gate.snapshot)],
+          tx,
+        );
+      }
       await query(
         "UPDATE applications SET runner_state='queued',updated_at=now() WHERE id=$1",
         [id],
@@ -603,6 +756,7 @@ export async function createServer() {
     ]);
     if (!d || !existsSync(d.path))
       throw new InputError("Document indisponible");
+    await query("UPDATE documents SET viewed_at=now() WHERE id=$1", [d.id]);
     reply
       .header("Content-Type", "application/pdf")
       .header(
@@ -618,6 +772,15 @@ export async function createServer() {
     if (!d || !existsSync(d.path)) throw new InputError("Document introuvable");
     if (d.profile_id !== (await currentProfile()).id)
       throw new InputError("Document issu dun ancien profil");
+    if (approved && !d.viewed_at)
+      throw new InputError("Consultez le PDF avant de l'approuver");
+    if (approved && d.job_id) {
+      const [job] = await query("SELECT data FROM jobs WHERE id=$1", [
+        d.job_id,
+      ]);
+      if (d.content.jobHash !== hash(job.data))
+        throw new InputError("Document issu d'une ancienne offre");
+    }
     await query(
       "UPDATE documents SET approved_at=CASE WHEN $2 THEN now() ELSE NULL END WHERE id=$1",
       [id, approved],

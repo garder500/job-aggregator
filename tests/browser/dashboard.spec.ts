@@ -19,6 +19,7 @@ test("dashboard prive, vues et mobile sans debordement", async ({ page }) => {
   for (const name of [
     "Candidatures",
     "Documents",
+    "À valider",
     "Connecteurs",
     "Configuration",
   ]) {
@@ -27,7 +28,7 @@ test("dashboard prive, vues et mobile sans debordement", async ({ page }) => {
       .getByRole("button", { name, exact: true })
       .click();
     await expect(
-      page.getByRole("heading", { name, exact: true }),
+      page.getByRole("heading", { name, exact: true }).first(),
     ).toBeVisible();
   }
   await page.setViewportSize({ width: 390, height: 844 });

@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+cd "$(dirname "$0")/.."
+ENV_FILE=${ENV_FILE:-.env}
+STATE_DIR=${POSTE_STATE_DIR:-.ops}
+mkdir -p "$STATE_DIR"
+CAPTURE_TEMP=''
+OPERATION=''
+cleanup() { if [[ -n "$CAPTURE_TEMP" && -d "$CAPTURE_TEMP" ]]; then rm -rf -- "$CAPTURE_TEMP"; fi; }
+on_exit() { local status=$?; cleanup; if [[ "$status" != 0 && -n "$OPERATION" ]]; then failure "$OPERATION"; fi; }
+trap on_exit EXIT
+exec 9>"$STATE_DIR/operator.lock"
+flock -n 9 || { echo 'Another operator command is running' >&2; exit 1; }
+dc() { docker compose --env-file "$ENV_FILE" -f compose.production.yaml "$@"; }
+setting() { dc config --format json | jq -r --arg k "$1" '.services.app.environment[$k] // empty'; }
+if [[ -f "$STATE_DIR/current-image" ]]; then export POSTE_IMAGE=$(<"$STATE_DIR/current-image"); fi
+export POSTE_IMAGE=${POSTE_IMAGE:-ghcr.io/garder500/job-aggregator@sha256:0000000000000000000000000000000000000000000000000000000000000000}
+sql() { dc exec -T postgres psql -U job -d jobs -v ON_ERROR_STOP=1 -Atc "$1"; }
+record() { sql "INSERT INTO operational_checks(kind,state) VALUES('$1','$2') ON CONFLICT(kind) DO UPDATE SET state=excluded.state,checked_at=now()" >/dev/null; }
+load_storage() {
+  export AWS_ACCESS_KEY_ID=$(setting AWS_ACCESS_KEY_ID) AWS_SECRET_ACCESS_KEY=$(setting AWS_SECRET_ACCESS_KEY)
+  export AWS_DEFAULT_REGION=$(setting AWS_DEFAULT_REGION)
+  S3_ENDPOINT_URL=$(setting S3_ENDPOINT_URL)
+  [[ -z "$S3_ENDPOINT_URL" || "$S3_ENDPOINT_URL" == https://* ]] || { echo 'S3 endpoint must use HTTPS' >&2; exit 1; }
+  S3_BUCKET=$(setting S3_BUCKET)
+  [[ "$S3_BUCKET" =~ ^[a-z0-9][a-z0-9.-]+$ ]] || { echo 'S3_BUCKET required' >&2; exit 1; }
+  S3_ARGS=()
+  if [[ -n "$S3_ENDPOINT_URL" ]]; then S3_ARGS=(--endpoint-url "$S3_ENDPOINT_URL"); fi
+}
+s3() { aws "${S3_ARGS[@]}" s3 "$@"; }
+doctor() {
+  for cmd in docker jq flock age aws sha256sum tar; do command -v "$cmd" >/dev/null || { echo "Missing $cmd" >&2; exit 1; }; done
+  docker info >/dev/null
+  dc config --quiet
+  [[ $(setting APP_PASSWORD | wc -c) -ge 21 && $(setting SESSION_SECRET | wc -c) -ge 33 ]] || { echo 'Weak application secrets' >&2; exit 1; }
+  [[ $(setting APP_PASSWORD) != local-development-only && $(setting POSTGRES_PASSWORD) != replace-db-password ]] || { echo 'Replace example credentials' >&2; exit 1; }
+  [[ $(setting APP_ORIGIN) =~ ^https?://[^/]+$ ]] || { echo 'APP_ORIGIN must be an exact origin' >&2; exit 1; }
+  [[ $(df -Pk "$STATE_DIR" | awk 'NR==2 {print $4}') -ge ${MIN_FREE_KB:-2097152} ]] || { echo 'Insufficient disk space' >&2; exit 1; }
+  [[ -n $(setting BACKUP_AGE_RECIPIENT) ]] || { echo 'BACKUP_AGE_RECIPIENT required' >&2; exit 1; }
+  load_storage
+  aws "${S3_ARGS[@]}" s3api head-bucket --bucket "$S3_BUCKET" >/dev/null
+  echo 'Preflight passed; backup will verify storage write/read permissions'
+}
+freeze() {
+  sql 'UPDATE maintenance SET active=true' >/dev/null
+  for ((i=0;i<120;i++)); do
+    [[ $(sql "SELECT count(*) FROM applications WHERE runner_state IN ('preparing','submitting')") == 0 ]] && break
+    sleep 2
+  done
+  [[ $(sql "SELECT count(*) FROM applications WHERE runner_state IN ('preparing','submitting')") == 0 ]] || { echo 'Runner did not drain; maintenance remains active' >&2; exit 1; }
+  dc stop worker runner app
+}
+resume() {
+  dc up -d --no-deps app worker runner
+  dc up -d --no-deps --wait app worker runner
+  sql 'UPDATE maintenance SET active=false' >/dev/null
+}
+capture() {
+  local temp archive base prefix keep old
+  temp=$(mktemp -d "$STATE_DIR/capture.XXXXXX")
+  CAPTURE_TEMP=$temp
+  archive="$STATE_DIR/poste-$(date -u +%Y%m%dT%H%M%S%NZ).tar.age"
+  dc exec -T postgres pg_dump -U job -d jobs -Fc >"$temp/database.dump"
+  printf '%s\n' "$POSTE_IMAGE" >"$temp/image-digest.txt"
+  dc run --rm --no-deps -T --entrypoint tar app -C / -cf - data sessions >"$temp/files.tar"
+  tar -C "$temp" -cf - database.dump files.tar image-digest.txt | age -r "$(setting BACKUP_AGE_RECIPIENT)" -o "$archive"
+  rm -rf "$temp"
+  CAPTURE_TEMP=''
+  base=$(basename "$archive")
+  (cd "$STATE_DIR" && sha256sum "$base" >"$base.sha256")
+  load_storage
+  s3 cp "$archive" "s3://$S3_BUCKET/daily/$base" --only-show-errors
+  s3 cp "$archive.sha256" "s3://$S3_BUCKET/daily/$base.sha256" --only-show-errors
+  s3 cp "s3://$S3_BUCKET/daily/$base" "$archive.verify" --only-show-errors
+  cmp "$archive" "$archive.verify"
+  rm "$archive.verify"
+  s3 cp "s3://$S3_BUCKET/daily/$base.sha256" "$archive.sha256.verify" --only-show-errors
+  cmp "$archive.sha256" "$archive.sha256.verify"
+  rm "$archive.sha256.verify"
+  if [[ $(date -u +%u) == 7 ]]; then
+    s3 cp "$archive" "s3://$S3_BUCKET/weekly/$base" --only-show-errors
+    s3 cp "$archive.sha256" "s3://$S3_BUCKET/weekly/$base.sha256" --only-show-errors
+    s3 cp "s3://$S3_BUCKET/weekly/$base" "$archive.verify" --only-show-errors
+    cmp "$archive" "$archive.verify"
+    rm "$archive.verify"
+  fi
+  for spec in daily:7 weekly:4; do
+    prefix=${spec%:*}; keep=${spec#*:}
+    aws "${S3_ARGS[@]}" s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$prefix/" --output json |
+      jq -r --arg p "$prefix/" '.Contents[]? | .Key | select(startswith($p)) | ltrimstr($p) | select(test("^poste-[0-9TZ]+\\.tar\\.age$"))' |
+      sort -r >"$STATE_DIR/retention-list"
+    while read -r old; do
+      [[ -z "$old" ]] && continue
+      s3 rm "s3://$S3_BUCKET/$prefix/$old" --only-show-errors
+      s3 rm "s3://$S3_BUCKET/$prefix/$old.sha256" --only-show-errors
+    done < <(tail -n +$((keep+1)) "$STATE_DIR/retention-list")
+  done
+  record backup completed
+  printf '%s\n' "$archive" >"$STATE_DIR/last-backup"
+  # Keep only seven local copies after remote verification; weekly copies remain offsite.
+  while read -r old; do
+    [[ -z "$old" ]] && continue
+    rm -- "$STATE_DIR/$old" "$STATE_DIR/$old.sha256"
+  done < <(find "$STATE_DIR" -maxdepth 1 -type f -name 'poste-*.tar.age' -printf '%f\n' | sort -r | tail -n +8)
+}
+failure() { echo 'Operation failed. Verify maintenance and service state before resuming.' >&2; record "$1" failed 2>/dev/null || true; }
+case ${1:-help} in
+  doctor) doctor ;;
+  backup) OPERATION=backup; doctor; freeze; capture; resume ;;
+  deploy)
+    OPERATION=deploy
+    [[ ${2:-} =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]] || { echo 'deploy requires GHCR image@sha256:digest' >&2; exit 1; }
+    doctor
+    old=$POSTE_IMAGE
+    had_current=false
+    # Capture with the current image, not the new one.
+    if dc exec -T postgres psql -U job -d jobs -Atc 'SELECT 1 FROM maintenance' >/dev/null 2>&1; then
+      had_current=true
+      freeze; capture
+    else
+      existing=$(docker volume ls -q --filter "label=com.docker.compose.project=${POSTE_PROJECT:-poste}" --filter label=com.docker.compose.volume=postgres)
+      [[ -z "$existing" ]] || { echo 'Existing database requires maintenance migration first' >&2; exit 1; }
+    fi
+    if $had_current; then printf '%s\n' "$old" >"$STATE_DIR/previous-image"; fi
+    export POSTE_IMAGE=$2
+    printf '%s\n' "$POSTE_IMAGE" >"$STATE_DIR/pending-image"
+    dc pull app worker runner migrate
+    dc up -d --wait postgres
+    dc run --rm --no-deps migrate
+    sql 'UPDATE maintenance SET active=true' >/dev/null
+    resume
+    printf '%s\n' "$POSTE_IMAGE" >"$STATE_DIR/current-image"
+    rm "$STATE_DIR/pending-image"
+    ;;
+  rollback)
+    OPERATION=rollback
+    [[ -f "$STATE_DIR/previous-image" ]] || { echo 'No previous image recorded' >&2; exit 1; }
+    freeze
+    export POSTE_IMAGE=$(<"$STATE_DIR/previous-image")
+    sql 'SELECT name FROM migrations ORDER BY name' >"$STATE_DIR/database-migrations"
+    dc run --rm --no-deps -T --entrypoint node app -e "console.log(require('fs').readdirSync('/app/migrations').filter(n=>n.endsWith('.sql')).sort().join('\n'))" >"$STATE_DIR/image-migrations"
+    cmp "$STATE_DIR/database-migrations" "$STATE_DIR/image-migrations" || { echo 'Schema differs: restore the pre-deploy backup explicitly; rollback refused' >&2; exit 1; }
+    # Never execute old migrations or restore data implicitly.
+    dc up -d --no-deps --force-recreate app worker runner
+    dc up -d --no-deps --wait app worker runner
+    sql 'UPDATE maintenance SET active=false' >/dev/null
+    printf '%s\n' "$POSTE_IMAGE" >"$STATE_DIR/current-image"
+    ;;
+  restore)
+    [[ ${POSTE_PROJECT:-} == poste-restore-* && -n ${POSTE_STATE_DIR:-} ]] || { echo 'Use isolated POSTE_PROJECT=poste-restore-... and POSTE_STATE_DIR' >&2; exit 1; }
+    [[ ${POSTE_PORT:-3001} != 3001 && -n ${APP_ORIGIN:-} ]] || { echo 'Restore requires an isolated POSTE_PORT and explicit APP_ORIGIN' >&2; exit 1; }
+    [[ -f ${2:-} && -f ${3:-} && -f "$2.sha256" ]] || { echo 'restore requires archive, checksum sidecar and age key file' >&2; exit 1; }
+    (cd "$(dirname "$2")" && sha256sum -c "$(basename "$2").sha256")
+    temp=$(mktemp -d "$STATE_DIR/restore.XXXXXX")
+    trap 'rm -rf "$temp"' EXIT
+    age -d -i "$3" "$2" | tar -C "$temp" -xf -
+    [[ $(<"$temp/image-digest.txt") == "$POSTE_IMAGE" ]] || { echo 'Restore image must match archive image-digest.txt' >&2; exit 1; }
+    dc up -d --wait postgres
+    [[ $(dc exec -T postgres psql -U job -d jobs -Atc "SELECT count(*) FROM pg_tables WHERE schemaname='public'") == 0 ]] || { echo 'Restore destination must be empty' >&2; exit 1; }
+    dc exec -T postgres pg_restore -U job -d jobs --exit-on-error <"$temp/database.dump"
+    sql 'UPDATE maintenance SET active=true' >/dev/null
+    dc run --rm --no-deps -T --user root --cap-add CHOWN --cap-add DAC_OVERRIDE --entrypoint sh app -c 'tar -C / -xf - && chown -R node:node /data /sessions' <"$temp/files.tar"
+    dc up -d --no-deps --wait app
+    echo 'Isolated restore ready. Keep workers stopped. Inspect an offer and its PDF.'
+    ;;
+  record-restore)
+    [[ ${2:-} == verified ]] || { echo 'Requires actual isolated restore and PDF inspection: record-restore verified' >&2; exit 1; }
+    record restore completed ;;
+  *) echo 'Usage: bash ops/poste doctor|deploy IMAGE@DIGEST|backup|rollback|restore ARCHIVE KEY|record-restore verified' ;;
+esac

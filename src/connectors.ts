@@ -158,49 +158,7 @@ export async function collectConnector(id: string) {
         [id],
       );
     } catch (e) {
-      const structural = e instanceof NetworkError && e.structural;
-      const [row] = await query(
-        "UPDATE connectors SET failures=failures+1,last_error=$2 WHERE id=$1 RETURNING *",
-        [
-          id,
-          structural ? "Structure ou acces a verifier" : "Collecte interrompue",
-        ],
-      );
-      if (row) {
-        const structuralFailures = structural
-          ? Number(row.cursor.structuralFailures || 0) + 1
-          : 0;
-        const delay =
-          e instanceof NetworkError && e.retryAfterMs
-            ? e.retryAfterMs
-            : Math.min(21600000, 60000 * 2 ** Math.min(row.failures, 8)) +
-              Math.floor(Math.random() * 10000);
-        await query(
-          "UPDATE connectors SET cursor=cursor || $2::jsonb,enabled=CASE WHEN $3 THEN false ELSE enabled END WHERE id=$1",
-          [
-            id,
-            JSON.stringify({
-              nextAllowed: new Date(Date.now() + delay).toISOString(),
-              structuralFailures,
-            }),
-            structural &&
-              (structuralFailures >= 3 ||
-                /challenge|restreint/i.test(String(e))),
-          ],
-        );
-        await event("connector.failed", id, {
-          structural,
-          failures: row.failures,
-        });
-        if (row.failures === 3) {
-          const { queueNotification } = await import("./notifications.js");
-          await queueNotification(
-            `connector:${id}:${row.last_success_at || "initial"}`,
-            `Connecteur ${row.name} interrompu. Verification requise.`,
-            null,
-          );
-        }
-      }
+      await recordConnectorFailure(id, e);
     }
   } finally {
     try {
@@ -214,5 +172,44 @@ export async function collectConnector(id: string) {
     } finally {
       client.release();
     }
+  }
+}
+export async function recordConnectorFailure(id: string, error: unknown) {
+  const structural = error instanceof NetworkError && error.structural;
+  const [row] = await query(
+    "UPDATE connectors SET failures=failures+1,last_error=$2 WHERE id=$1 RETURNING *",
+    [id, structural ? "Structure ou acces a verifier" : "Collecte interrompue"],
+  );
+  if (!row) return;
+  const structuralFailures = structural
+    ? Number(row.cursor.structuralFailures || 0) + 1
+    : 0;
+  const delay =
+    error instanceof NetworkError && error.retryAfterMs
+      ? error.retryAfterMs
+      : Math.min(21600000, 60000 * 2 ** Math.min(row.failures, 8)) +
+        Math.floor(Math.random() * 10000);
+  const suspended =
+    structural &&
+    (structuralFailures >= 3 || /challenge|restreint/i.test(String(error)));
+  await query(
+    "UPDATE connectors SET cursor=cursor || $2::jsonb,enabled=CASE WHEN $3 THEN false ELSE enabled END WHERE id=$1",
+    [
+      id,
+      JSON.stringify({
+        nextAllowed: new Date(Date.now() + delay).toISOString(),
+        structuralFailures,
+      }),
+      suspended,
+    ],
+  );
+  await event("connector.failed", id, { structural, failures: row.failures });
+  if (row.failures === 3 || suspended) {
+    const { queueNotification } = await import("./notifications.js");
+    await queueNotification(
+      `connector:${id}:${row.last_success_at || "initial"}`,
+      `Connecteur ${row.name} interrompu. Verification requise.`,
+      null,
+    );
   }
 }

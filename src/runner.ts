@@ -28,7 +28,11 @@ export const formSchema = z.object({
   confirmationText: z.string().min(5).max(500),
 });
 export class ReviewError extends Error {}
-export async function automationGate(applicationId: string, tx?: Tx) {
+export async function automationGate(
+  applicationId: string,
+  tx?: Tx,
+  checkApproval = true,
+) {
   const [app] = await query(
     "SELECT * FROM applications WHERE id=$1",
     [applicationId],
@@ -72,7 +76,7 @@ export async function automationGate(applicationId: string, tx?: Tx) {
   )
     throw new ReviewError("Analyse IA absente ou reserves a verifier");
   const candidates = await query(
-    "SELECT * FROM documents WHERE profile_id=$1 AND (job_id=$2 OR (job_id IS NULL AND kind='cv')) AND approved_at IS NOT NULL ORDER BY created_at DESC",
+    "SELECT * FROM documents WHERE profile_id=$1 AND (job_id=$2 OR (job_id IS NULL AND kind='cv')) AND approved_at IS NOT NULL AND viewed_at IS NOT NULL ORDER BY created_at DESC",
     [profile.id, app.job_id],
     tx,
   );
@@ -80,7 +84,7 @@ export async function automationGate(applicationId: string, tx?: Tx) {
     (d) => d.job_id === null || d.content.jobHash === hash(result.job.data),
   );
   if (!docs.some((d) => d.kind === "cv"))
-    throw new ReviewError("CV courant non approuve");
+    throw new ReviewError("CV courant non consulte ou non approuve");
   const form = formSchema.parse(connector.config);
   if (canonicalUrl(form.url) !== result.job.canonical_url)
     throw new ReviewError("Le formulaire ne correspond plus a cette offre");
@@ -93,7 +97,46 @@ export async function automationGate(applicationId: string, tx?: Tx) {
   );
   if (Number(count.n) >= prefs.dailyLimit)
     throw new ReviewError("Plafond quotidien atteint");
-  return { app, prefs, profile, connector, docs, form, job: result.job };
+  const snapshot = {
+    profileId: profile.id,
+    jobHash: hash(result.job.data),
+    connectorHash: hash([
+      connector.id,
+      connector.config,
+      connector.submission_mode,
+    ]),
+    documentIds: ["cv", ...(form.letterLabel ? ["letter"] : [])].map(
+      (kind) => docs.find((d) => d.kind === kind)!.id,
+    ),
+  };
+  if (checkApproval && connector.submission_mode === "review_required") {
+    const [approval] = await query(
+      "SELECT * FROM submission_approvals WHERE application_id=$1 AND expires_at>now() AND consumed_at IS NULL",
+      [applicationId],
+      tx,
+    );
+    if (
+      !approval ||
+      approval.snapshot.profileId !== snapshot.profileId ||
+      approval.snapshot.jobHash !== snapshot.jobHash ||
+      approval.snapshot.connectorHash !== snapshot.connectorHash ||
+      JSON.stringify(approval.snapshot.documentIds) !==
+        JSON.stringify(snapshot.documentIds)
+    )
+      throw new ReviewError(
+        "Approbation de soumission absente, expiree ou modifiee",
+      );
+  }
+  return {
+    app,
+    prefs,
+    profile,
+    connector,
+    docs,
+    form,
+    job: result.job,
+    snapshot,
+  };
 }
 export async function prepareForm(
   page: Page,
@@ -260,7 +303,7 @@ export async function runApplication(
       throw new ReviewError("Le formulaire ne correspond plus a cette offre");
     if (!options.testLocal) validatePublicUrl(form.url);
     const candidates = await query(
-      "SELECT * FROM documents WHERE profile_id=$1 AND (job_id=$2 OR (job_id IS NULL AND kind='cv')) AND approved_at IS NOT NULL ORDER BY created_at DESC",
+      "SELECT * FROM documents WHERE profile_id=$1 AND (job_id=$2 OR (job_id IS NULL AND kind='cv')) AND approved_at IS NOT NULL AND viewed_at IS NOT NULL ORDER BY created_at DESC",
       [profile.id, app.job_id],
     );
     const docs = candidates.filter(
@@ -352,6 +395,12 @@ export async function runApplication(
         [id],
         tx,
       );
+      if (fresh.connector.submission_mode === "review_required")
+        await query(
+          "UPDATE submission_approvals SET consumed_at=now() WHERE application_id=$1",
+          [id],
+          tx,
+        );
       await query(
         "UPDATE application_attempts SET state='submitting',created_at=now() WHERE id=$1",
         [attempt],

@@ -22,9 +22,11 @@ export async function currentProfile(
   return { ...row, data: profileSchema.parse(row.data) };
 }
 export async function settings(tx?: Tx) {
-  return settingsSchema.parse(
+  const prefs = settingsSchema.parse(
     (await query("SELECT data FROM settings", [], tx))[0].data,
   );
+  const [maintenance] = await query("SELECT active FROM maintenance", [], tx);
+  return { ...prefs, paused: prefs.paused || maintenance.active };
 }
 export async function ingest(input: JobInput, raw: unknown = input) {
   const job = normalizeJob(input);
@@ -215,6 +217,16 @@ export async function mergeJobs(left: string, right: string) {
     await query(
       "UPDATE documents SET job_id=$1 WHERE job_id=$2",
       [left, right],
+      tx,
+    );
+    await query(
+      "UPDATE operation_items SET job_id=$1 WHERE job_id=$2",
+      [left, right],
+      tx,
+    );
+    await query(
+      "DELETE FROM submission_approvals WHERE application_id IN (SELECT id FROM applications WHERE job_id=$1)",
+      [left],
       tx,
     );
     await query(

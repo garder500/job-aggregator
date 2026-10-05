@@ -1,0 +1,80 @@
+name: ${POSTE_PROJECT:-poste}
+x-runtime: &runtime
+  image: ${POSTE_IMAGE:?Use a GHCR image pinned by digest}
+  env_file: ${ENV_FILE:-.env}
+  environment:
+    APP_ORIGIN: ${APP_ORIGIN:?Set APP_ORIGIN}
+  restart: unless-stopped
+  init: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  cpus: ${SERVICE_CPUS:-1.0}
+  mem_limit: ${SERVICE_MEMORY:-1g}
+  logging: &logging
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+  volumes: ["documents:/data", "sessions:/sessions"]
+services:
+  postgres:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jobs
+      POSTGRES_USER: job
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: ["postgres:/var/lib/postgresql"]
+    cpus: ${POSTGRES_CPUS:-1.0}
+    mem_limit: ${POSTGRES_MEMORY:-1g}
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U job -d jobs"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  migrate:
+    <<: *runtime
+    restart: "no"
+    command: ["node", "--import", "tsx", "src/migrate.ts"]
+    depends_on:
+      postgres: { condition: service_healthy }
+  app:
+    <<: *runtime
+    ports: ["127.0.0.1:${POSTE_PORT:-3001}:3001"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+  worker:
+    <<: *runtime
+    command: ["node", "--import", "tsx", "src/worker.ts"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "node", "--import", "tsx", "src/healthcheck.ts", "worker"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+  runner:
+    <<: *runtime
+    command: ["node", "--import", "tsx", "src/runner-main.ts"]
+    shm_size: 256mb
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "node", "--import", "tsx", "src/healthcheck.ts", "runner"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+volumes:
+  postgres:
+  documents:
+  sessions:

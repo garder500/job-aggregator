@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily Poste backup
+[Timer]
+OnCalendar=*-*-* 03:00:00 Europe/Paris
+RandomizedDelaySec=15m
+Persistent=true
+[Install]
+WantedBy=timers.target

@@ -176,6 +176,51 @@ try {
     origin: process.env.APP_ORIGIN,
     cookie: `${cookie.name}=${cookie.value}`,
   };
+  const setup = await app.inject({ method: "GET", url: "/api/setup", headers });
+  assert.equal(setup.statusCode, 200);
+  assert.equal(setup.json().configured.imap, false);
+  assert(!setup.body.includes("test-password"));
+  const unviewedApproval = await app.inject({
+    method: "POST",
+    url: `/api/documents/${cv}/approve`,
+    headers,
+    payload: { approved: true },
+  });
+  assert.equal(unviewedApproval.statusCode, 409);
+  const viewedPdf = await app.inject({
+    method: "GET",
+    url: `/api/documents/${cv}/download`,
+    headers,
+  });
+  assert.equal(viewedPdf.statusCode, 200);
+  const viewedApproval = await app.inject({
+    method: "POST",
+    url: `/api/documents/${cv}/approve`,
+    headers,
+    payload: { approved: true },
+  });
+  assert.equal(viewedApproval.statusCode, 200);
+  const diagnostic = await app.inject({
+    method: "POST",
+    url: "/api/diagnostics/imap",
+    headers: { ...headers, "idempotency-key": "integration-diagnostic" },
+    payload: {},
+  });
+  assert.equal(diagnostic.statusCode, 200);
+  const repeatedDiagnostic = await app.inject({
+    method: "POST",
+    url: "/api/diagnostics/imap",
+    headers: { ...headers, "idempotency-key": "integration-diagnostic" },
+    payload: {},
+  });
+  assert.equal(repeatedDiagnostic.json().id, diagnostic.json().id);
+  const { runDiagnostic } = await import("../src/diagnostics.js");
+  await runDiagnostic("imap");
+  assert.equal(
+    (await query("SELECT state FROM diagnostics WHERE integration='imap'"))[0]
+      .state,
+    "failed",
+  );
   const list = await app.inject({ method: "GET", url: "/api/jobs", headers });
   assert.equal(list.statusCode, 200);
   assert.equal(list.json().length, 1);
@@ -279,7 +324,7 @@ try {
   await new Promise<void>((done) => fixture!.listen(0, "127.0.0.1", done));
   const fixturePort = (fixture.address() as any).port;
   const master = await generateDocument(null, "cv");
-  await query("UPDATE documents SET approved_at=now() WHERE id=$1", [master]);
+  await query("UPDATE documents SET approved_at=now(),viewed_at=now() WHERE id=$1", [master]);
   async function localApplication(flow: string) {
     const url = `http://127.0.0.1:${fixturePort}/job/${flow}`;
     const imported = await ingest({
@@ -321,9 +366,10 @@ try {
     )[0].runner_state,
     "ready",
   );
-  await query("UPDATE connectors SET auto_submit=true WHERE id=$1", [
-    confirmed.connector_id,
-  ]);
+  await query(
+    "UPDATE connectors SET auto_submit=true,submission_mode='automatic' WHERE id=$1",
+    [confirmed.connector_id],
+  );
   const { tasks } = await import("../src/tasks.js");
   await tasks.process_job({ id: confirmed.job_id });
   assert.equal(
@@ -359,6 +405,69 @@ try {
   await query("UPDATE settings SET data=jsonb_set(data,'{dailyLimit}','1')");
   await assert.rejects(() => automationGate(uncertain.id), /Plafond/);
   await query("UPDATE settings SET data=jsonb_set(data,'{dailyLimit}','5')");
+  const { createBatch, submissionEligibility } =
+    await import("../src/operations.js");
+  const reviewTokens = {
+    [uncertain.id]: (await submissionEligibility(uncertain.id)).reviewToken!,
+  };
+  await assert.rejects(() => automationGate(uncertain.id), /Approbation/);
+  const batch = await createBatch(
+    {
+      action: "submit",
+      applicationIds: [uncertain.id, confirmed.id],
+      reviewTokens,
+    },
+    "integration-batch-submit",
+  );
+  assert.equal(
+    (
+      await createBatch(
+        {
+          action: "submit",
+          applicationIds: [uncertain.id, confirmed.id],
+          reviewTokens,
+        },
+        "integration-batch-submit",
+      )
+    ).id,
+    batch.id,
+  );
+  assert.equal(
+    (
+      await query(
+        "SELECT count(*) n FROM operation_items WHERE operation_id=$1",
+        [batch.id],
+      )
+    )[0].n,
+    "2",
+  );
+  assert.equal(
+    (
+      await query(
+        "SELECT count(*) n FROM operation_items WHERE operation_id=$1 AND state='excluded'",
+        [batch.id],
+      )
+    )[0].n,
+    "1",
+  );
+  await assert.rejects(
+    () =>
+      createBatch(
+        { action: "cv", applicationIds: [uncertain.id] },
+        "integration-batch-submit",
+      ),
+    /idempotence/,
+  );
+  await query(
+    "UPDATE submission_approvals SET expires_at=now()-interval '1 second' WHERE application_id=$1",
+    [uncertain.id],
+  );
+  await assert.rejects(() => automationGate(uncertain.id), /Approbation/);
+  await query(
+    "UPDATE submission_approvals SET expires_at=now()+interval '24 hours' WHERE application_id=$1",
+    [uncertain.id],
+  );
+  await automationGate(uncertain.id);
   await runApplication(uncertain.id, "submit", { testLocal: true });
   assert.equal(submits, 2);
   assert.equal(
@@ -372,6 +481,152 @@ try {
   await runApplication(uncertain.id, "submit", { testLocal: true });
   assert.equal(submits, 2);
   const crashed = await localApplication("crashed");
+  const changed = await localApplication("changed");
+  await runApplication(changed.id, "prepare", { testLocal: true });
+  await query("UPDATE connectors SET auto_submit=true WHERE id=$1", [
+    changed.connector_id,
+  ]);
+  const changedReviewToken = (await submissionEligibility(changed.id))
+    .reviewToken!;
+  await createBatch(
+    {
+      action: "submit",
+      applicationIds: [changed.id],
+      reviewTokens: {
+        [changed.id]: changedReviewToken,
+      },
+    },
+    "integration-changed-approval",
+  );
+  await query(
+    "UPDATE jobs SET data=jsonb_set(data,'{description}',to_jsonb((data->>'description') || ' Updated')) WHERE id=$1",
+    [changed.job_id],
+  );
+  assert.equal(
+    (
+      await query(
+        "SELECT count(*) n FROM submission_approvals WHERE application_id=$1",
+        [changed.id],
+      )
+    )[0].n,
+    "0",
+  );
+  await assert.rejects(() => automationGate(changed.id), /Approbation/);
+  await query("UPDATE applications SET runner_state='ready' WHERE id=$1", [
+    changed.id,
+  ]);
+  const staleReviewBatch = await createBatch(
+    {
+      action: "submit",
+      applicationIds: [changed.id],
+      reviewTokens: { [changed.id]: changedReviewToken },
+    },
+    "integration-stale-review",
+  );
+  assert.equal(
+    (
+      await query("SELECT state FROM operation_items WHERE operation_id=$1", [
+        staleReviewBatch.id,
+      ])
+    )[0].state,
+    "excluded",
+  );
+  await query(
+    "UPDATE applications SET runner_state='needs_review' WHERE id=$1",
+    [changed.id],
+  );
+  const { enrichJob } = await import("../src/operations.js");
+  const targeted = await generateDocument(id, "cv");
+  await query(
+    "UPDATE documents SET approved_at=now(),viewed_at=now() WHERE id=$1",
+    [targeted],
+  );
+  await query(
+    "INSERT INTO connectors(id,name,kind,enabled,authorized,config) VALUES('enrichment-fixture','Owned enrichment','html',true,true,$1)",
+    [
+      JSON.stringify({
+        url: base.url,
+        allowedHosts: ["example.com"],
+        authorizationEvidence: "Owned enrichment fixture",
+      }),
+    ],
+  );
+  const [enrichOp] = await query(
+    "INSERT INTO operations(kind,idempotency_key,request_hash) VALUES('enrich','integration-enrich','fixture') RETURNING id",
+  );
+  const [enrichItem] = await query(
+    "INSERT INTO operation_items(operation_id,job_id) VALUES($1,$2) RETURNING id",
+    [enrichOp.id, id],
+  );
+  const enrichmentHtml = `<script type="application/ld+json">${JSON.stringify({ "@type": "JobPosting", title: base.title, url: base.url, hiringOrganization: { name: base.company }, description: `${base.description} Enriched description with additional verified responsibilities and complete context.` })}</script>`;
+  await enrichJob(
+    { itemId: enrichItem.id, jobId: id, connectorId: "enrichment-fixture" },
+    async () => ({
+      text: enrichmentHtml,
+      url: base.url,
+      headers: new Headers(),
+    }),
+  );
+  assert.equal(
+    (
+      await query("SELECT state FROM operation_items WHERE id=$1", [
+        enrichItem.id,
+      ])
+    )[0].state,
+    "completed",
+  );
+  assert.equal(
+    (
+      await query("SELECT approved_at FROM documents WHERE id=$1", [targeted])
+    )[0].approved_at,
+    null,
+  );
+  assert.equal(
+    (
+      await query("SELECT count(*) n FROM jobs WHERE canonical_url=$1", [
+        base.url,
+      ])
+    )[0].n,
+    "1",
+  );
+  for (let n = 0; n < 3; n++) {
+    await query(
+      "UPDATE connectors SET cursor=cursor - 'nextAllowed' WHERE id='enrichment-fixture'",
+    );
+    const [failureItem] = await query(
+      "INSERT INTO operation_items(operation_id,job_id) VALUES($1,$2) RETURNING id",
+      [enrichOp.id, id],
+    );
+    await enrichJob(
+      { itemId: failureItem.id, jobId: id, connectorId: "enrichment-fixture" },
+      async () => ({
+        text: "<html>Changed DOM</html>",
+        url: base.url,
+        headers: new Headers(),
+      }),
+    );
+    assert.equal(
+      (
+        await query("SELECT state FROM operation_items WHERE id=$1", [
+          failureItem.id,
+        ])
+      )[0].state,
+      "failed",
+    );
+  }
+  assert.equal(
+    (
+      await query(
+        "SELECT enabled FROM connectors WHERE id='enrichment-fixture'",
+      )
+    )[0].enabled,
+    false,
+  );
+  assert.equal(
+    (await query("SELECT enabled FROM connectors WHERE id='manual'"))[0]
+      .enabled,
+    true,
+  );
   await query(
     "UPDATE applications SET runner_state='submitting',updated_at=now()-interval '11 minutes' WHERE id=$1",
     [crashed.id],

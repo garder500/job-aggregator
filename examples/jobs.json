@@ -1,0 +1,22 @@
+[
+  {
+    "title": "Developpeur TypeScript",
+    "company": "Entreprise Exemple",
+    "location": "Paris",
+    "url": "https://example.com/jobs/123",
+    "source": "manual",
+    "description": "Developpement TypeScript et React. Profil recherche : TypeScript, PostgreSQL, Docker. CDI.",
+    "requiredText": "TypeScript PostgreSQL Docker",
+    "skills": ["TypeScript", "React", "PostgreSQL", "Docker"],
+    "contract": "CDI",
+    "remote": "hybrid",
+    "seniority": "senior",
+    "salary": {
+      "min": 55000,
+      "max": 65000,
+      "currency": "EUR",
+      "period": "year",
+      "basis": "gross"
+    }
+  }
+]

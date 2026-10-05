@@ -1,0 +1,7 @@
+From: alerts@linkedin.example
+To: candidate@example.test
+Subject: Nouvelles offres
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><article><a href="https://www.linkedin.com/jobs/view/fixture-2">Ingenieur logiciel</a><p>React TypeScript</p></article></html>

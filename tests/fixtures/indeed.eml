@@ -1,0 +1,7 @@
+From: alerts@indeed.example
+To: candidate@example.test
+Subject: Nouvelles offres
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><table><tr><td><a href="https://www.indeed.fr/viewjob?jk=fixture-1">Developpeur TypeScript</a><p>CDI TypeScript Docker</p></td></tr></table></html>

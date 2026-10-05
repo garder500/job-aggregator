@@ -1,0 +1,7 @@
+From: alerts@hellowork.example
+To: candidate@example.test
+Subject: Nouvelles offres
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><article><a href="https://www.hellowork.com/fr-fr/emplois/fixture-4.html">Ingenieur DevOps</a><p>Terraform Kubernetes CDI</p></article></html>

@@ -1,0 +1,7 @@
+From: alerts@meteojob.example
+To: candidate@example.test
+Subject: Nouvelles offres
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><article><a href="https://www.meteojob.com/job/fixture-3">Developpeur backend</a><p>Python Docker CDI</p></article></html>

@@ -1,0 +1,12 @@
+{
+  "url": "https://example.com/jobs/123",
+  "allowedHosts": ["example.com"],
+  "authorizationEvidence": "A renseigner avec la preuve reelle d'autorisation",
+  "fields": [
+    { "label": "Nom complet", "profileKey": "name" },
+    { "label": "Email", "profileKey": "email" }
+  ],
+  "cvLabel": "CV",
+  "submitLabel": "Postuler",
+  "confirmationText": "Votre candidature a ete recue"
+}

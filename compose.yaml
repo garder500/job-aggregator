@@ -1,0 +1,79 @@
+name: poste
+x-service: &service
+  build: .
+  env_file: ${ENV_FILE:-.env}
+  restart: unless-stopped
+  init: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  volumes:
+    - documents:/data
+    - sessions:/sessions
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+services:
+  postgres:
+    image: postgres:18-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: jobs
+      POSTGRES_USER: job
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: ["postgres:/var/lib/postgresql"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U job -d jobs"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  migrate:
+    build: .
+    env_file: ${ENV_FILE:-.env}
+    command: ["node", "--import", "tsx", "src/migrate.ts"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  app:
+    <<: *service
+    ports: ["127.0.0.1:3001:3001"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  worker:
+    <<: *service
+    command: ["node", "--import", "tsx", "src/worker.ts"]
+  runner:
+    <<: *service
+    command: ["node", "--import", "tsx", "src/runner-main.ts"]
+    shm_size: 256mb
+  backup:
+    profiles: ["backup"]
+    build:
+      context: .
+      dockerfile: ops/backup.Dockerfile
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      PGHOST: postgres
+      PGUSER: job
+      PGDATABASE: jobs
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - documents:/data:ro
+      - sessions:/sessions:ro
+      - ./backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  postgres:
+  documents:
+  sessions:
